@@ -1,0 +1,5 @@
+# 依赖版本锚定：与开发机实际安装版本一致，避免幻影 API
+Flask==3.1.3
+Flask-SQLAlchemy==3.1.1
+PyMySQL==1.2.3
+python-dotenv==1.2.4
