@@ -123,6 +123,7 @@ CREATE TABLE t_transaction (
   category_src ENUM('rule','manual','uncategorized')
                             NOT NULL DEFAULT 'uncategorized' COMMENT '归类来源',
   is_refund    TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '1=该行本身是退款记录，统计时剔除',
+  is_primary   TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '1=计入消费统计 0=资金镜像行（防跨源双计）',
   remark       VARCHAR(255) DEFAULT NULL  COMMENT '备注',
   created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (trans_id),
@@ -130,6 +131,7 @@ CREATE TABLE t_transaction (
   KEY idx_trans_time      (user_id, trade_time),
   KEY idx_trans_category  (user_id, category_id, trade_time),
   KEY idx_trans_direction (user_id, direction, trade_time),
+  KEY idx_trans_primary   (user_id, is_primary, direction, trade_time),
   CONSTRAINT fk_trans_user     FOREIGN KEY (user_id)
     REFERENCES t_user (user_id)     ON DELETE CASCADE,
   CONSTRAINT fk_trans_batch    FOREIGN KEY (batch_id)
@@ -217,22 +219,32 @@ SET FOREIGN_KEY_CHECKS = 1;
 
 -- =============================================================
 --  视图层：把统计口径固定下来，应用层不再重复写 WHERE
+--  统一口径：仅支出 / 剔除退款行 / 剔除资金镜像行(is_primary=0) / 仅支付成功
 -- =============================================================
 
--- 视图 1：月度消费汇总
--- 口径：仅支出 / 剔除退款行 / 仅支付成功
+-- 视图 1：月度汇总（同时给出两个口径，避免"消费"与"资金流出"混为一谈）
+--   消费口径 consumption_out  —— 只含 is_consumption=1 的分类，是分析用的口径
+--   非消费资金流出 non_consumption_out —— 学费/转账/理财，量级很大（实测占月度流出 43%），
+--                                        不单列会让人误以为"某个月消费暴涨"
+--   未分类行（category_id IS NULL）按消费计入，宁可多算不可漏算
 CREATE OR REPLACE VIEW v_monthly_summary AS
 SELECT
   t.user_id,
   DATE_FORMAT(t.trade_time, '%Y-%m')      AS ym,
   COUNT(*)                                AS trans_cnt,
   ROUND(SUM(t.amount), 2)                 AS total_out,
+  ROUND(SUM(CASE WHEN COALESCE(c.is_consumption, 1) = 1 THEN t.amount ELSE 0 END), 2)
+                                          AS consumption_out,
+  ROUND(SUM(CASE WHEN COALESCE(c.is_consumption, 1) = 0 THEN t.amount ELSE 0 END), 2)
+                                          AS non_consumption_out,
   ROUND(AVG(t.amount), 2)                 AS avg_amount,
   ROUND(MAX(t.amount), 2)                 AS max_amount,
   COUNT(DISTINCT DATE(t.trade_time))      AS active_days
 FROM t_transaction t
+LEFT JOIN t_category c ON c.category_id = t.category_id
 WHERE t.direction = 'out'
   AND t.is_refund = 0
+  AND t.is_primary = 1
   AND (t.trade_status IS NULL OR t.trade_status NOT IN ('已全额退款', '交易关闭'))
 GROUP BY t.user_id, DATE_FORMAT(t.trade_time, '%Y-%m');
 
@@ -254,6 +266,7 @@ JOIN t_idle_label l ON l.trans_id = t.trans_id
 JOIN t_category   c ON c.category_id = t.category_id
 WHERE t.direction = 'out'
   AND t.is_refund = 0
+  AND t.is_primary = 1
   AND c.is_consumption = 1
 GROUP BY c.category_id, c.category_name;
 
@@ -275,7 +288,8 @@ FROM t_transaction t
 JOIN t_idle_label l ON l.trans_id = t.trans_id
 LEFT JOIN t_category c ON c.category_id = t.category_id
 WHERE l.is_idle = 1
-  AND t.is_refund = 0;
+  AND t.is_refund = 0
+  AND t.is_primary = 1;
 
 
 -- 视图 4：模型训练集（特征 + 标签一次取出，Python 端直接读）
@@ -300,4 +314,21 @@ FROM t_trans_feature f
 JOIN t_transaction t ON t.trans_id = f.trans_id
 JOIN t_idle_label  l ON l.trans_id = f.trans_id
 WHERE t.direction = 'out'
-  AND t.is_refund = 0;
+  AND t.is_refund = 0
+  AND t.is_primary = 1;
+
+
+-- 视图 5：数据完整性 —— 各来源的月度覆盖情况
+--   用途：账单导出很容易缺月份（微信单次可导时间范围有限，实测就漏了半年）。
+--   没有这个视图，"7 月消费只有 150 元"这种结论会被当成真实下降，
+--   实际上是那几个月根本没有数据。分析前必须先看这张表。
+CREATE OR REPLACE VIEW v_source_coverage AS
+SELECT
+  DATE_FORMAT(t.trade_time, '%Y-%m') AS ym,
+  SUM(b.source = 'wechat')           AS wechat_cnt,
+  SUM(b.source = 'alipay')           AS alipay_cnt,
+  SUM(b.source = 'bank')             AS bank_cnt,
+  COUNT(*)                           AS total_cnt
+FROM t_transaction t
+JOIN t_import_batch b ON b.batch_id = t.batch_id
+GROUP BY DATE_FORMAT(t.trade_time, '%Y-%m');
