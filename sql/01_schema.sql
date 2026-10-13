@@ -40,6 +40,14 @@ CREATE TABLE t_user (
 
 -- -------------------------------------------------------------
 -- 2. t_category  消费分类（树形，支持二级）
+--    ★ is_durable 是把"统计口径"从代码里搬进数据的关键字段 ★
+--      立项时"实物类"是靠 SQL 里手写一串 code 排除（NOT IN ('FOOD','TRAFFIC',...)）
+--      来实现的，口径散落在应用层多处，改一次要全文搜索，且极易漏改
+--      （实测漏改过一次，样本量从 1255 虚高到 1457）。
+--      现在改成分类表上的一个字段：有没有"买回来放着不用"的可能。
+--        1 = 耐用品，可能有闲置，纳入标注与建模范围
+--        0 = 即时消耗 / 服务，消费发生的瞬间就被消耗掉，闲置率恒为 0
+--      → 所有统计统一写 c.is_durable = 1，口径只有这一处
 -- -------------------------------------------------------------
 CREATE TABLE t_category (
   category_id    INT UNSIGNED AUTO_INCREMENT COMMENT '分类主键',
@@ -47,11 +55,13 @@ CREATE TABLE t_category (
   category_code  VARCHAR(20)   NOT NULL          COMMENT '业务编码，如 FOOD / DIGITAL',
   category_name  VARCHAR(50)   NOT NULL          COMMENT '分类名称',
   is_consumption TINYINT(1)    NOT NULL DEFAULT 1 COMMENT '1=消费类 0=非消费类（转账/理财/收入）',
+  is_durable     TINYINT(1)    NOT NULL DEFAULT 0 COMMENT '1=耐用品（可能有闲置，纳入标注建模）0=即时消耗/服务（闲置率恒为0）',
   sort_no        SMALLINT      NOT NULL DEFAULT 0 COMMENT '排序号',
   PRIMARY KEY (category_id),
   UNIQUE KEY uk_category_code (category_code),
   UNIQUE KEY uk_category_name (parent_id, category_name),
   KEY idx_category_parent (parent_id),
+  KEY idx_category_durable (is_consumption, is_durable),
   CONSTRAINT fk_category_parent FOREIGN KEY (parent_id)
     REFERENCES t_category (category_id) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='消费分类表（树形）';
@@ -165,6 +175,17 @@ CREATE TABLE t_trans_feature (
 -- -------------------------------------------------------------
 -- 7. t_idle_label  闲置标注（人工标注，模型训练标签）
 --    ★ 这是整个项目最核心的数据资产：任何公开数据集都没有这列
+--
+--    ★ sample_stratum：分层抽样层，配合 v_idle_candidate 使用 ★
+--      低于 20 元的小额消费占总笔数 8 成、占总金额 2 成，
+--      逐笔标注不现实（约 900 笔，且 ¥2.7 一单根本回忆不起买的是什么），
+--      标 >=20 元全部 + 小额分层抽样，再用抽样比加权还原总量。
+--      此字段记录"这笔属于哪一层"，是加权与事后审计的唯一依据。
+--      'all'       = 全样本层（>=20 元，全部标注）
+--      's1_0_5'    = 抽样层 0~5 元
+--      's2_5_10'   = 抽样层 5~10 元
+--      's3_10_20'  = 抽样层 10~20 元
+--      NULL        = 非抽样设计产生（如手工补标）
 -- -------------------------------------------------------------
 CREATE TABLE t_idle_label (
   label_id    INT UNSIGNED AUTO_INCREMENT COMMENT '标注主键',
@@ -175,11 +196,13 @@ CREATE TABLE t_idle_label (
                    '三分钟热度','促销囤货','其他')
                            DEFAULT NULL COMMENT '闲置原因',
   used_days   SMALLINT UNSIGNED DEFAULT NULL COMMENT '实际使用天数（自估）',
+  sample_stratum VARCHAR(16) DEFAULT NULL COMMENT '抽样层：all/s1_0_5/s2_5_10/s3_10_20，见 v_idle_candidate',
   label_time  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '标注时间',
   note        VARCHAR(255) DEFAULT NULL COMMENT '备注',
   PRIMARY KEY (label_id),
   UNIQUE KEY uk_label_trans (trans_id),
   KEY idx_label_idle (is_idle, idle_degree),
+  KEY idx_label_stratum (sample_stratum),
   CONSTRAINT fk_label_trans FOREIGN KEY (trans_id)
     REFERENCES t_transaction (trans_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='闲置标注表（模型标签）';
@@ -251,6 +274,8 @@ GROUP BY t.user_id, DATE_FORMAT(t.trade_time, '%Y-%m');
 
 -- 视图 2：各分类闲置率（项目的核心分析口径）
 -- idle_rate = 闲置笔数 / 已标注笔数，只统计有标注的记录，避免分母污染
+-- ⚠ 这里用 is_durable = 1 而不是 is_consumption = 1：
+--   即时消耗类（餐饮/交通/服务）不会有闲置，留在分母里会稀释闲置率
 CREATE OR REPLACE VIEW v_category_idle_rate AS
 SELECT
   c.category_id,
@@ -268,6 +293,7 @@ WHERE t.direction = 'out'
   AND t.is_refund = 0
   AND t.is_primary = 1
   AND c.is_consumption = 1
+  AND c.is_durable = 1
 GROUP BY c.category_id, c.category_name;
 
 
@@ -332,3 +358,83 @@ SELECT
 FROM t_transaction t
 JOIN t_import_batch b ON b.batch_id = t.batch_id
 GROUP BY DATE_FORMAT(t.trade_time, '%Y-%m');
+
+
+-- =============================================================
+--  视图 6~8：标注口径与分层抽样（2026-10-12 新增）
+--
+--  背景：原先"哪些交易该标注"是靠分析时手写一串 code 排除的，
+--        口径散落、改一次要全文搜索，且实测漏改过（样本量 1255 → 虚高 1457）。
+--        现在收敛成 v_idle_candidate 一个入口，任何统计都从它出发。
+--
+--  再一个背景：>=20 元只有 201 笔，占实物金额 74%；
+--        小额 900 多笔占 26% 金额，不能直接丢掉（丢了闲置率就是有偏的），
+--        也不能逐笔标（¥2.7 一单回忆不起来）。→ 分层抽样 + 事后加权。
+-- =============================================================
+
+-- 视图 6：标注候选全集（口径唯一来源）
+--   口径：支出 / 非退款 / 计入统计(is_primary=1) / 消费类 / 耐用品 / 支付成功
+--   stratum：全样本层 all（>=20 元）与三个抽样层 s1~s3
+CREATE OR REPLACE VIEW v_idle_candidate AS
+SELECT
+  t.trans_id,
+  t.user_id,
+  t.trade_time,
+  t.counterparty,
+  t.product_desc,
+  t.amount,
+  c.category_id,
+  c.category_code,
+  c.category_name,
+  CASE
+    WHEN t.amount >= 20 THEN 'all'
+    WHEN t.amount >= 10 THEN 's3_10_20'
+    WHEN t.amount >= 5  THEN 's2_5_10'
+    ELSE                     's1_0_5'
+  END AS stratum
+FROM t_transaction t
+JOIN t_category c ON c.category_id = t.category_id
+WHERE t.direction = 'out'
+  AND t.is_refund = 0
+  AND t.is_primary = 1
+  AND c.is_consumption = 1
+  AND c.is_durable = 1
+  AND (t.trade_status IS NULL OR t.trade_status NOT IN ('已全额退款', '交易关闭'));
+
+
+-- 视图 7：各抽样层的总体权重
+--   weight = 层内候选笔数 / 层内已标注笔数，即"一笔标注代表几笔真实交易"
+--   ⚠ 层内标注数必须 > 0，否则 NULLIF 会让 weight 变 NULL（该层不可估计）
+CREATE OR REPLACE VIEW v_stratum_weight AS
+SELECT
+  v.stratum,
+  COUNT(*)                                                          AS universe_cnt,
+  SUM(CASE WHEN l.label_id IS NOT NULL THEN 1 ELSE 0 END)            AS labeled_cnt,
+  ROUND(COUNT(*) / NULLIF(SUM(CASE WHEN l.label_id IS NOT NULL THEN 1 ELSE 0 END), 0), 4)
+                                                                    AS weight
+FROM v_idle_candidate v
+LEFT JOIN t_idle_label l ON l.trans_id = v.trans_id
+GROUP BY v.stratum;
+
+
+-- 视图 8：按抽样比加权还原后的分类闲置率（论文里的正式口径）
+--   为什么必须加权：小额层抽样了 60/319，直接算笔数比例会让小额层权重被压到 19%，
+--   而它在总体中实际占 30%。加权后各层按真实占比回归。
+--   est_amount_idle_rate = 闲置金额 / 待考察金额（金额口径，回避小额"笔数多但钱少"的失真）
+CREATE OR REPLACE VIEW v_category_idle_rate_weighted AS
+SELECT
+  c.category_id,
+  c.category_name,
+  COUNT(*)                                                                    AS labeled_cnt,
+  ROUND(SUM(w.weight), 2)                                                     AS est_universe_cnt,
+  ROUND(SUM(CASE WHEN l.is_idle = 1 THEN w.weight ELSE 0 END), 2)              AS est_idle_cnt,
+  ROUND(SUM(t.amount * w.weight), 2)                                          AS est_total_amount,
+  ROUND(SUM(CASE WHEN l.is_idle = 1 THEN t.amount * w.weight ELSE 0 END), 2)   AS est_wasted_amount,
+  ROUND(SUM(CASE WHEN l.is_idle = 1 THEN t.amount * w.weight ELSE 0 END)
+        / NULLIF(SUM(t.amount * w.weight), 0), 4)                             AS est_amount_idle_rate
+FROM t_idle_label l
+JOIN t_transaction t   ON t.trans_id   = l.trans_id
+JOIN t_category    c   ON c.category_id = t.category_id
+JOIN v_idle_candidate v ON v.trans_id  = l.trans_id
+JOIN v_stratum_weight w ON w.stratum   = v.stratum
+GROUP BY c.category_id, c.category_name;
