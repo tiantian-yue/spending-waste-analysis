@@ -36,8 +36,12 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.services.importers import pipeline                        # noqa: E402
+# 食品判定复用 reclass_food_as_groc 的同一份词表：
+# 候选里混着食品时给个提示，避免两边规则漂移。
+from reclass_food_as_groc import split_alts, is_food              # noqa: E402
 
 DEFAULT_SEED = 20261012          # 与示例数据生成器同源，便于记忆
 DEFAULT_PER_STRATUM = 60
@@ -105,6 +109,12 @@ def fetch_candidates(conn) -> list[dict]:
             d["pd"] = d["gt"] or clean_desc(d["pd"])
             if d["pd"] and d["pd"] == d["cp"]:
                 d["pd"] = ""                      # 商品名跟店铺名一模一样 = 没信息，别占两列
+            # 候选里含食品的提示：真身不明（同金额多件），但候选里是吃的，
+            # 让用户一眼能挑出来 —— 吃的东西不用纠结闲置不闲置。
+            parts = split_alts(d["alt"]) if not d["pd"] else []
+            foodish = [p for p in parts if is_food(p)[0]]
+            d["fh"] = len(foodish)
+            d["fn"] = len(parts)
             out.append(d)
 
     # 自检：trade_time 必须是真的被格式化过。
@@ -229,6 +239,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   .tag.ok{background:var(--green-l);border-color:#bfdccb;color:var(--green)}
   .tag.gray{background:var(--gray-l);color:var(--gray)}
   .tag.all{background:var(--blue-l);border-color:#cfe0f2;color:var(--blue)}
+  .tag.food{background:var(--red-l);border-color:#e6c4bf;color:var(--red);font-weight:600}
   .muted{color:var(--muted)}
   .mini{font-size:12px}
   .dt{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px 16px;align-items:start}
@@ -261,15 +272,18 @@ TEMPLATE = r"""<!DOCTYPE html>
   <div class="card" style="border-color:#e8d9b6;background:var(--gold-l)">
     <h2 style="color:var(--gold)">商品名从哪来的（先看这段）</h2>
     <div style="font-size:13px">
-      微信/支付宝账单在电商这笔上**只记到收单机构**，不记商品：
+      微信/支付宝账单在电商这笔上<b>只记到收单机构</b>，不记商品：
       <span class="mini muted">对方=「拼多多平台商户」、商品说明=「先用后付」</span>。
       所以直接看账单，¥12.80 一单根本想不起来买的是什么 —— 这不是你记性差，是数据本身没有。
       <br><br>
-      本次已用**拼多多订单列表**（你自己导出的那份）把商品名还原回账单：
+      本次已用<b>拼多多订单列表</b>（你自己导出的那份）把商品名还原回账单：
       <b id="h-named">0</b> 笔有真实商品名，<b id="h-alt">0</b> 笔只还原出候选（金额相同有几件，
       黄标「候选待判」，展开能看到候选列表，自己挑），剩余 <b id="h-noname">0</b> 笔确实无从还原
       （线下门店那类，商户名本身就说明了买什么）。<br>
       <b>点工具条的「只看没商品名的」可以专门处理剩下这些。</b>
+      <br><br>
+      <span style="color:var(--red)">吃的东西（零食/生鲜/饮料/调味）已整批改判「食品生鲜」自动移出，
+      不用标 —— 吃的东西不存在买回来闲置。<span id="h-food"></span></span>
     </div>
   </div>
 
@@ -324,6 +338,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     </select>
     <label class="chk"><input type="checkbox" id="f-need"> 只看需补品类</label>
     <label class="chk"><input type="checkbox" id="f-noname"> 只看没商品名的</label>
+    <label class="chk"><input type="checkbox" id="f-food"> 只看含食品候选</label>
     <span class="grow"></span>
     <button id="btn-expand">全部展开</button>
     <button id="btn-print">打印清单</button>
@@ -396,12 +411,14 @@ function fillFilters(){
 }
 function filtered(){
   const q=$("#q").value.trim().toLowerCase(), fs=$("#f-stratum").value, fc=$("#f-cat").value,
-        st=$("#f-state").value, need=$("#f-need").checked, noname=$("#f-noname").checked;
+        st=$("#f-state").value, need=$("#f-need").checked, noname=$("#f-noname").checked,
+        food=$("#f-food").checked;
   const out = ROWS.filter(r=>{
     if(fs && r.stratum!==fs) return false;
     if(fc && r.category_code!==fc) return false;
     if(need && r.category_code!=="ECOMM") return false;
     if(noname && (r.pd || r.alt)) return false;
+    if(food && !(r.fh>0)) return false;
     if(q && (r.cp+r.pd+r.alt+r.spec+r.category_name).toLowerCase().indexOf(q)<0) return false;
     const s=state[r.id]||{}, moved=movedOut(r);
     // 已移出标注范围的（品类被改判为即时消耗）：只在"全部状态"和"只看已移出"里出现
@@ -436,7 +453,9 @@ function rowHTML(r){
     if(r.spec) goods += `<span class="mini muted"> · ${esc(r.spec)}</span>`;
     if(r.gm==="fuzzy") goods += ` <span class="tag warn" title="金额相同有多个候选，跨类，建议扫一眼">存疑</span>`;
   }else if(r.alt){
-    goods = `<span class="tag warn">候选待判</span> <span class="mini muted">${esc(r.alt)}</span>`;
+    // 候选里含食品 → 加红标提示：吃的东西不会闲置，确认是吃的直接改判"移出"
+    const fhTag = r.fh ? `<span class="tag food" title="候选里有 ${r.fh}/${r.fn} 件是吃的；吃的东西不用标闲置">含食品 ${r.fh}/${r.fn}</span> ` : "";
+    goods = fhTag + `<span class="tag warn">候选待判</span> <span class="mini muted">${esc(r.alt)}</span>`;
   }else{
     // 没有任何商品名：平台单是"平台没记"，线下店是"店铺名本身就说清了"
     goods = isPlatform(r.raw_cp)
@@ -510,6 +529,9 @@ function updateStats(){
   $("#k-out").textContent=outCnt; $("#h-need").textContent=need; $("#h-total").textContent=total;
   const hn=$("#h-named"), ha=$("#h-alt"), hz=$("#h-noname");
   if(hn) hn.textContent=named; if(ha) ha.textContent=alt; if(hz) hz.textContent=platNo;
+  const hf=$("#h-food"), foodish = ROWS.filter(r=>r.fh>0).length;
+  if(hf) hf.textContent = foodish
+      ? `（另有 ${foodish} 笔候选里混着食品、真身待定，已标红「含食品」，扫一眼即可）` : "（本批已全部排除）";
   $("#bar").style.width=(done/total*100).toFixed(1)+"%";
   $("#p-done").textContent = done + " / " + total;
   $("#hint").textContent = done===0 ? "点任意一行展开，开始判定 →"
@@ -539,7 +561,7 @@ document.addEventListener("input", e=>{
   if(el.id==="q"){ render(); return; }
   if(el.classList.contains("n")){ S(el.dataset.id).note=el.value; save(); }
 });
-["f-stratum","f-cat","f-state","f-sort","f-need","f-noname"].forEach(id=>$("#"+id).addEventListener("change",render));
+["f-stratum","f-cat","f-state","f-sort","f-need","f-noname","f-food"].forEach(id=>$("#"+id).addEventListener("change",render));
 
 $("#btn-expand").onclick=()=>{
   const anyClosed = ROWS.some(r=>!open[r.id]);
@@ -556,13 +578,13 @@ function download(name, text){
   setTimeout(()=>URL.revokeObjectURL(a.href),4000);
 }
 $("#btn-csv").onclick=()=>{
-  const head=["trans_id","交易时间","抽样层","店铺或对方","商品名","规格","候选（待人工确认）","商品名匹配强度",
+  const head=["trans_id","交易时间","抽样层","店铺或对方","商品名","规格","候选（待人工确认）","商品名匹配强度","候选含食品数",
               "金额","原分类","最终品类","品类名称","是否闲置","闲置程度","闲置原因","使用天数","备注"];
   const lines=[head.join(",")];
   ROWS.forEach(r=>{
     const s=state[r.id]||{};
     const cat=effCat(r);
-    const cells=[r.id,r.tm,r.stratum,r.cp,r.pd,r.spec||"",r.alt||"",r.gm||"",
+    const cells=[r.id,r.tm,r.stratum,r.cp,r.pd,r.spec||"",r.alt||"",r.gm||"",(r.fh||0),
       r.amount.toFixed(2),r.category_code,cat,CATNAME[cat],
       movedOut(r)?"已移出":(s.idle===""||s.idle===undefined?"":(s.idle==="1"?"闲置":"在用")),
       s.deg||"",s.reason||"",s.days||"",s.note||""];
