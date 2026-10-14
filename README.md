@@ -59,8 +59,9 @@ spending-waste-analysis/
 │   ├── reclass_service.py  候选池里的服务/充值 → 改判 SERVICE（同上，自动层）
 │   ├── gen_label_workbench.py 生成分层抽样的闲置盘点工作台（研究用 · 逐笔）
 │   ├── gen_waste_checkup.py 生成品类级「浪费体检」页（产品用 · 24 次点击出结论）
+│   ├── gen_result_import.py 生成「体检结果导入」页（你粘贴我解析，绕过下载拦截）
 │   ├── selftest_workbench.js  盘点工作台离线自检（不需要浏览器，见「自检」）
-│   └── selftest_checkup.js    浪费体检页离线自检（同上）
+│   └── selftest_checkup.js    浪费体检页离线自检（同上，26 项）
 ├── sql/
 │   ├── 01_schema.sql       建库 + 9 表 + 8 视图 + 索引
 │   ├── 02_seed.sql         18 个分类 + 307 条自动分类规则 + 开发账号
@@ -94,6 +95,7 @@ python scripts/import_bills.py
 # 5. 拼多多品类回填（依赖 data/pdd_orders_raw.csv，见下文）
 mysql -uroot < sql/03_backfill_pdd.sql
 # 6. 商品名补全（本地专属：需要你自己的拼多多订单导出，产物不入库）
+mysql -uroot < sql/04_add_goods_detail.sql
 python scripts/gen_goods_detail_sql.py --csv data/pdd_match.csv data/pdd_match_all.csv
 mysql -uroot < sql/05_goods_detail.sql
 # 7. 食品改判（本地专属：靠上一步的商品名，把零食生鲜移出标注范围）
@@ -102,7 +104,13 @@ mysql -uroot < sql/06_food_as_groc.sql
 # 8. 服务改判（本地专属：驾校/话费这类服务不存在「买回来闲置」）
 python scripts/reclass_service.py --write-sql
 mysql -uroot < sql/07_service_out.sql
-# 9. 启动
+# 9. 生成三个页面（研究用工作台 / 产品用体检页 / 结果回传页），并跑自检
+python scripts/gen_label_workbench.py
+python scripts/gen_waste_checkup.py
+python scripts/gen_result_import.py
+node scripts/selftest_workbench.js "闲置盘点工作台.html"
+node scripts/selftest_checkup.js   "浪费体检.html"
+# 10. 启动
 python run.py
 ```
 
@@ -314,8 +322,21 @@ python run.py
 
 ```bash
 node scripts/selftest_workbench.js "闲置盘点工作台.html"   # 9 项
-node scripts/selftest_checkup.js   "浪费体检.html"          # 23 项
+node scripts/selftest_checkup.js   "浪费体检.html"          # 26 项
 ```
+
+**别信"能下载"**：内置预览面板是沙箱 iframe，没有 `allow-downloads`，
+`a.download` 会被**静默拦掉**——不报错、无提示，用户只看到"点了没反应"。
+所以导出通道不能只有下载一条：
+
+| 通道 | 何时能用 | 兜底 |
+|------|---------|------|
+| `navigator.clipboard.writeText` | 安全上下文 + 有权限 | 返回 `"hook"`（异步，不确定成败） |
+| `document.execCommand("copy")` | 老接口，绝大多数情况可用 | 返回 `"ok"` / `"fail"` |
+| 弹窗手动全选复制 | **永远可用** | `"fail"` / `"hook"` 时自动弹出 |
+
+配套的「体检结果导入」页（`scripts/gen_result_import.py`）就是**粘贴通道**：
+把导出的内容粘进去 → 核对 → 生成可落库 JSON，整条链路不经过下载。
 
 ## 数据库
 
@@ -362,6 +383,40 @@ MySQL 8.0，库名 `spending_waste`，字符集 `utf8mb4`。共 **9 张表 + 8 �
 一旦就地覆盖商品名，同一份账单重导会算出不同指纹、整批数据翻倍。
 故商品名补全走 `t_goods_detail`、情境特征走 `t_trans_feature`：两者都能整表重建，
 事实表保持只读。这条规则救了两次场（改特征、补商品名）。
+
+### 事故复盘：脚本写死 category_id，把主库删了
+
+为建一个临时导入库，我用 `sed` 批量改 `<库名>` 重跑 `sql/01_schema.sql`，
+但**只替换了 `CREATE DATABASE`，漏掉第 15 行的 `DROP DATABASE IF EXISTS spending_waste`**
+——脚本自己把主库删了。恢复链（**已实测可用，写在这里当 SOP**）：
+
+```bash
+# 1. 重建空库（备份是 --no-create-db 导出的，不含 CREATE/USE，必须先建库）
+mysql -uroot -e "CREATE DATABASE spending_waste DEFAULT CHARSET utf8mb4"
+# 2. 灌回备份（884K，含 3783 行）
+mysql -uroot spending_waste < "F:/allstudy/_db_backup/spending_waste_20261014_回填拼多多品类前.sql"
+# 3. 幂等重放脚本链（全部 + 子查询写法，可反复跑）
+mysql -uroot spending_waste < sql/03_backfill_pdd.sql   # 候选池 1114→776
+mysql -uroot spending_waste < sql/04_add_goods_detail.sql
+mysql -uroot spending_waste < sql/05_goods_detail.sql   # 959 行
+mysql -uroot spending_waste < sql/06_food_as_groc.sql   # 776→712
+mysql -uroot spending_waste < sql/07_service_out.sql    # 712→705
+```
+
+重放后逐项校验：**3783 / 2516 / ¥83,094.45 / 资金镜像 54**，候选池 **705**，
+品类分布 ECOMM 256 / APPAREL 155 / LIFE 151 / STUDY 110 / DIGITAL 17 / HOBBY 16
+—— 与事故前完全一致，零数据损失。
+
+两条硬教训：
+
+1. **`category_id` 不可写死。** `AUTO_INCREMENT` 在恢复后从 1 重排，
+   原先 `GROC = 14`、恢复后变成 **94**。写死 14 会直接踩
+   `ERROR 1452 (23000): Cannot add or update a child row ... fk_trans_category`。
+   所有补丁脚本一律写
+   `SET category_id = (SELECT category_id FROM t_category WHERE category_code='GROC')`。
+2. **临时库用完立刻 drop。** 事故的诱因就是 `spending_waste_import` 这个临时库
+   长期留在实例里，才需要去改 `01_schema.sql`。现在实例里只有
+   `spending_waste / sqlpractice / school` 三个业务库。
 
 ## 开发约定
 
