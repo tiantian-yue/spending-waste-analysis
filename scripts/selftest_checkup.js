@@ -37,9 +37,10 @@ let blobText = null;
 function mk(id) {
   return {
     id, textContent: "", innerHTML: "", value: "", checked: false,
-    style: {}, dataset: {},
+    style: { cssText: "" }, dataset: {},
     classList: { toggle() {}, add() {}, remove() {}, contains() { return false; } },
-    insertAdjacentHTML() {}, addEventListener() {}, appendChild() {},
+    setAttribute() {}, removeAttribute() {}, setSelectionRange() {},
+    insertAdjacentHTML() {}, addEventListener() {}, appendChild() {}, removeChild() {},
     showModal() {}, close() {}, select() {}, focus() {}, click() {},
     querySelector() { return mk("inner"); }, querySelectorAll() { return []; }
   };
@@ -52,12 +53,14 @@ const ctx = {
     addEventListener(t, f) { handlers[t] = f; },
     createElement: () => mk("a"),
     body: { appendChild() {}, removeChild() {} },
-    execCommand() {}
+    execCommand() { return true; }
   },
   localStorage: {
     _d: {}, getItem(k) { return this._d[k] || null; },
     setItem(k, v) { this._d[k] = v; }, removeItem(k) { delete this._d[k]; }
   },
+  // 剪贴板：故意让它缺 writeText，逼代码走 execCommand 回退路径
+  navigator: {},
   window: {}, console,
   Blob: function (p) { blobText = p.join(""); },
   URL: { createObjectURL: () => "blob:x", revokeObjectURL() {} },
@@ -159,6 +162,20 @@ const wasteRaw = catKeys.reduce((a, k) => a + META.cat[k].amt * 0.1, 0) + META.b
 ok(csv.indexOf(wasteRaw.toFixed(2)) >= 0, "CSV 汇总金额与页面一致", wasteRaw.toFixed(2));
 ok(csv.split("\r\n").length > 10, "CSV 有内容（含品类段 + 大额段）",
    `${csv.split("\r\n").length} 行`);
+
+// ---- 10. 导出兜底：下载被沙箱拦掉时，内容要能通过弹窗拿到 ----
+// 用户真实踩过的坑：预览面板是沙箱 iframe，`a.download` 会被静默拦掉，
+// 表现为"点了导出没反应、不报错"。所以导出必须有一条不依赖下载的出路。
+ok(els["#btn-text"] !== undefined, "存在「只复制文本」按钮（不依赖下载）");
+els["#dlg-body"].value = "";
+els["#btn-text"].onclick();
+const dlgText = els["#dlg-body"].value;
+ok(csv.length > 0 || dlgText.length > 0, "下载失败时弹窗里能拿到同样内容",
+   dlgText ? `${dlgText.length} 字符` : "(走了 execCommand 复制)");
+if (dlgText) {
+  ok(dlgText === csv, "弹窗内容与 CSV 完全一致（不是两份各自拼的）");
+  ok(dlgText.indexOf(String(bigKeys[0])) >= 0, "弹窗内容带真实交易号");
+}
 
 console.log(failed ? `\n✗ 有 ${failed} 项未通过` : "\n✓ 全部通过");
 process.exit(failed ? 1 : 0);

@@ -23,7 +23,7 @@ USE spending_waste;
 
 
 -- GROC：315 笔
-UPDATE t_transaction SET category_id = 14
+UPDATE t_transaction SET category_id = (SELECT category_id FROM t_category WHERE category_code='GROC')
  WHERE category_id = 12
    AND product_desc LIKE '%先用后付%'
    AND CONCAT(DATE_FORMAT(trade_time,'%Y-%m-%d %H:%i:%s'),'|',amount) IN (

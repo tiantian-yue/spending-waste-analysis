@@ -371,9 +371,11 @@ TEMPLATE = r"""<!DOCTYPE html>
       <button class="ghost" id="btn-all-05">一键：全部约一半闲置</button>
       <span style="flex:1"></span>
       <button class="primary" id="btn-csv">导出结论 CSV</button>
+      <button class="ghost" id="btn-text">只复制文本</button>
       <button class="ghost" id="btn-sql">导出回填 SQL</button>
       <button class="ghost warn" id="btn-reset">清空重来</button>
     </div>
+    <div class="mini muted" id="dl-hint" style="margin-top:6px"></div>
   </div>
 
   <h2>第一步 · 这几类东西，你买回来大概有多少是闲置的？</h2>
@@ -533,18 +535,29 @@ function csvCell(v){
   v = String(v == null ? "" : v);
   return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
 }
-function download(name, text){
-  const blob = new Blob(["\ufeff" + text], {type:"text/csv;charset=utf-8"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+// 把文本尽量塞进剪贴板，返回是否成功。三级回退：
+//   ① navigator.clipboard.writeText（需要安全上下文 + 用户手势）
+//   ② 临时 textarea + execCommand("copy")（老办法，沙箱里常可用）
+//   ③ 都失败 → 退化成"弹窗让你手动全选复制"
+function copyText(text){
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    try{ navigator.clipboard.writeText(text); return "hook"; }catch(e){}
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "readonly");
+  ta.style.cssText = "position:fixed;top:-1000px;opacity:0";
+  document.body.appendChild(ta);
+  ta.select(); ta.setSelectionRange(0, ta.value.length);
+  let ok = false;
+  try{ ok = document.execCommand("copy"); }catch(e){ ok = false; }
+  document.body.removeChild(ta);
+  return ok ? "ok" : "fail";
 }
 
-$("#btn-csv").onclick = () => {
+// 导出的内容统一从这一个函数出，CSV / 文本两条路都走它，避免两处口径漂移。
+// 注意：这里的算法必须和“浪费体检”页的 calc() 保持一致（同一份 META/state）。
+function buildLines(){
   const r = calc();
   const L = [];
   L.push(["汇总", "预计浪费", r.waste.toFixed(2), "候选池总额", r.total.toFixed(2)].join(","));
@@ -565,7 +578,56 @@ $("#btn-csv").onclick = () => {
     L.push([id, b.tm, b.cat, b.name, b.amt.toFixed(2),
             (v === undefined ? "未判" : LAB[v])].map(csvCell).join(","));
   });
-  download("浪费体检结论.csv", L.join("\r\n"));
+  return L;
+}
+
+$("#btn-csv").onclick = () => {
+  const text = buildLines().join("\r\n");
+  // 先尝试下载（浏览器里能用），无论成败都额外提供复制，因为
+  // **内置预览面板这类沙箱 iframe 会把下载静默拦掉**（用户踩过：点了没反应）。
+  let dlOk = false;
+  try{
+    const blob = new Blob(["\ufeff" + text], {type:"text/csv;charset=utf-8"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "浪费体检结论.csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    dlOk = true;
+  }catch(e){ dlOk = false; }
+
+  const cp = copyText(text);
+  const hint = $("#dl-hint");
+  if(cp === "fail" || cp === "hook"){
+    // 走到这里说明不能确定复制成功 → 弹窗兜底，内容一定拿得到
+    $("#dlg-t").textContent = "导出结论（请手动全选复制）";
+    $("#dlg-body").value = text;
+    $("#dlg").showModal();
+    hint.textContent = dlOk
+      ? "已尝试下载；若没弹出文件，请在上面窗口里全选复制。"
+      : "浏览器拦掉了下载，已把内容放上面窗口，请全选复制。";
+  }else{
+    hint.textContent = "已复制到剪贴板，粘到「体检结果导入」页即可。"
+      + (dlOk ? "（也尝试下载了 CSV）" : "");
+  }
+  setTimeout(() => { hint.textContent = ""; }, 6000);
+};
+
+// 只复制文本（某些浏览器里比下载更稳）
+$("#btn-text").onclick = () => {
+  const text = buildLines().join("\r\n");
+  const cp = copyText(text);
+  if(cp === "ok"){
+    $("#dl-hint").textContent = "已复制。粘到「体检结果导入」页即可。";
+  }else{
+    $("#dlg-t").textContent = "导出结论（请手动全选复制）";
+    $("#dlg-body").value = text;
+    $("#dlg").showModal();
+    $("#dl-hint").textContent = "自动复制不可用，已弹出内容，请全选复制。";
+  }
+  setTimeout(() => { $("#dl-hint").textContent = ""; }, 6000);
 };
 
 $("#btn-sql").onclick = () => {
