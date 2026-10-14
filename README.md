@@ -54,11 +54,14 @@ spending-waste-analysis/
 │   ├── classify_pdd_goods.py 商品标题 → 品类关键词归类
 │   ├── match_pdd_to_bills.py 品类匹配回交易（金额/标签/顺序三重判定）
 │   ├── gen_pdd_backfill_sql.py 固化匹配结果为 SQL 补丁
+│   ├── gen_goods_detail_sql.py 固化商品名补全结果为 SQL 补丁
 │   └── gen_label_workbench.py 生成分层抽样的闲置盘点工作台
 ├── sql/
-│   ├── 01_schema.sql       建库 + 8 表 + 5 视图 + 索引
+│   ├── 01_schema.sql       建库 + 9 表 + 8 视图 + 索引
 │   ├── 02_seed.sql         18 个分类 + 307 条自动分类规则 + 开发账号
-│   └── 03_backfill_pdd.sql 拼多多品类回填补丁（依赖导入后执行）
+│   ├── 03_backfill_pdd.sql 拼多多品类回填补丁（依赖导入后执行）
+│   ├── 04_add_goods_detail.sql 增量迁移：新增商品名补全表 + 挂进候选视图
+│   └── 05_goods_detail.sql 商品名补全数据（含个人购物记录，已 gitignore）
 ├── data/                   账单原始文件（已 gitignore，绝不提交）
 ├── docs/decisions/         架构决策记录（ADR）与未决事项
 ├── tests/                  测试
@@ -83,7 +86,10 @@ python scripts/import_bills.py --dry-run
 python scripts/import_bills.py
 # 5. 拼多多品类回填（依赖 data/pdd_orders_raw.csv，见下文）
 mysql -uroot < sql/03_backfill_pdd.sql
-# 6. 启动
+# 6. 商品名补全（本地专属：需要你自己的拼多多订单导出，产物不入库）
+python scripts/gen_goods_detail_sql.py --csv data/pdd_match.csv data/pdd_match_all.csv
+mysql -uroot < sql/05_goods_detail.sql
+# 7. 启动
 python run.py
 ```
 
@@ -146,6 +152,43 @@ python run.py
 回填顺带暴露了分类体系的缺口，新增 **食品生鲜 GROC**（294→315 笔 ¥3,843.90，
 占拼多多消费 41%，`is_durable = 0` 不参与闲置建模）。
 
+### 商品名补全（2026-10-14）
+
+上面那一步解决了"这笔算什么品类"，但**没解决"这笔到底买的是什么"**。
+
+问题的严重程度：标注候选 776 笔里有 653 笔是拼多多，其中 **523 笔的「商品说明」
+是占位文本**（`先用后付` / `消费` / `/` / `订单标题`）。人工标注时看到
+「¥12.80 先用后付」根本回忆不起买了什么 —— 这不是标注人记性差，是数据源没有这个信息。
+
+三种做法都不行：
+
+| 想法 | 为什么不行 |
+|------|-----------|
+| 直接改 `t_transaction.product_desc` | 它是 `dedup_key` 的输入，改了同一份账单重导会算出不同指纹 → 整批数据翻倍 |
+| 把商品名塞进 `t_idle_label.note` | 标签表是**标注结果**，不是商品事实；且同一交易的商品名应该独立于标注存在 |
+| 只留在 CSV 里 | 工作台读库生成，CSV 到不了页面，等于白干 |
+
+于是新增派生表 **`t_goods_detail`**（与 `t_trans_feature` 同一思路：可重建的东西
+不写进事实表），把商品名、店铺、规格、匹配强度落库，`v_idle_candidate` 左连接带出。
+
+匹配用两份回填结果合并（`--csv` 靠前的优先）：
+
+| 来源 | 口径 | 覆盖 | 高置信率 |
+|------|------|------|---------|
+| `pdd_match.csv` | 只用「先用后付」扣款 | 716 笔 | 94.6% |
+| `pdd_match_all.csv` | 全部拼多多支出 | 991 笔 | 76.9% |
+
+先用先占坑取高质量的部分，② 只补 ① 没覆盖的：最终 **865 笔**拿到真实商品标题、
+**94 笔**匹配没定夺（金额相同跨类，写进 `alt_titles` 交人工挑）、31 笔确实无从还原。
+
+效果（盘点工作台 346 行）：**有商品名 260 行 / 候选待判 34 行 / 只剩 16 行是纯平台单**，
+而改造前是 523 行占位文本。
+
+> ⚠ **`sql/05_goods_detail.sql` 不入库**（已 gitignore）。它含真实店铺名与商品标题，
+> 属个人购物记录；且商品名只能从**拼多多订单导出**还原，那份导出本身也不在仓库里。
+> clone 仓库的人拿不到商品名，是数据使然，不是设计缺陷 —— 其余环节（品类、口径、
+> 抽样、加权）全部可复现。
+
 ### 闲置标注口径（2026-10-12 定稿）
 
 哪些交易"可能有闲置"不再靠 SQL 里手写 code 排除，而是分类表上的
@@ -163,7 +206,7 @@ python run.py
 
 ## 数据库
 
-MySQL 8.0，库名 `spending_waste`，字符集 `utf8mb4`。共 **8 张表 + 8 个视图**。
+MySQL 8.0，库名 `spending_waste`，字符集 `utf8mb4`。共 **9 张表 + 8 个视图**。
 
 | 表 | 作用 |
 |----|------|
@@ -175,12 +218,14 @@ MySQL 8.0，库名 `spending_waste`，字符集 `utf8mb4`。共 **8 张表 + 8 �
 | `t_trans_feature` | 购买情境特征（与事实表分离，可整表重算） |
 | `t_idle_label` | 闲置标注（模型标签，项目最核心的数据资产） |
 | `t_risk_record` | 购买预警记录（含事后回填，构成评估闭环） |
+| `t_goods_detail` | 商品名补全（派生表，从订单列表还原；不改账单原文，见上节） |
 
-视图：`v_monthly_summary` / `v_category_idle_rate` / `v_top_waste` / `v_training_set` / `v_source_coverage`
+视图：`v_monthly_summary` / `v_category_idle_rate` / `v_top_waste` / `v_training_set` /
+`v_source_coverage` / `v_idle_candidate` / `v_stratum_weight` / `v_category_idle_rate_weighted`
 
 统计口径统一收敛到视图，应用层不重复写 WHERE 条件，避免同一指标多处算出不同结果。
 
-### 三个关键设计（答辩时的加分点）
+### 四个关键设计（答辩时的加分点）
 
 **1. 跨源重复必须处理，否则支出虚高。**
 同一笔钱会在多处留痕：微信零钱通充值在工行记为「理财」，支付宝扫码付款在工行记为「消费」。
@@ -198,6 +243,12 @@ MySQL 8.0，库名 `spending_waste`，字符集 `utf8mb4`。共 **8 张表 + 8 �
 收入 / 资金调拨是**事实**，账单里已经标了 `direction`，不该用关键词去猜。
 第一版只用关键词，导致 103 笔真实支出（商品名写作「收款方备注:二维码收款」）
 被误判成"收入"。现在按 `direction` 先判，关键词只用于"支出"的品类细分。
+
+**4. 事实表只放事实，能重算/能补全的东西另立派生表。**
+`dedup_key = MD5(来源+时间+金额+对方+商品说明)`，所以 `product_desc` 是**指纹的输入**，
+一旦就地覆盖商品名，同一份账单重导会算出不同指纹、整批数据翻倍。
+故商品名补全走 `t_goods_detail`、情境特征走 `t_trans_feature`：两者都能整表重建，
+事实表保持只读。这条规则救了两次场（改特征、补商品名）。
 
 ## 开发约定
 

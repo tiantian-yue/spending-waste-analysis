@@ -20,6 +20,15 @@
 用法
 ----
     python scripts/match_pdd_to_bills.py --orders data/pdd_classified.csv -o data/pdd_match.csv
+    # 只认「先用后付」扣款（默认，用于**品类**回填，避免动到已定品类）
+    python scripts/match_pdd_to_bills.py --scope all -o data/pdd_match_all.csv
+    # 全部拼多多支出（用于**商品名**补全，覆盖面更大）
+
+两个 scope 的用途不一样，别混
+------------------------------
+    先用后付（prepay）—— 这批原本就是「电商综合」待重分类的，重匹配只影响品类
+    全部（all）      —— 覆盖到已经定好品类的拼多多交易，只用来补商品名
+用 all 的结果去改 category_id 会**覆盖原有正确分类**，务必只取商品名。
 """
 from __future__ import annotations
 
@@ -44,10 +53,16 @@ def query(db: str, sql: str) -> list[list[str]]:
     return [l.split("\t") for l in r.stdout.splitlines() if l.strip()][1:]
 
 
-def load_transactions(db: str) -> list[dict]:
+def load_transactions(db: str, scope: str = "prepay") -> list[dict]:
+    if scope == "all":
+        # 覆盖全部拼多多支出：商品名补全用，覆盖面比「先用后付」大得多
+        where = "counterparty LIKE '%%拼多多%%'"
+    else:
+        # 原来的口径：只认「先用后付」扣款，是当时「电商综合」缺口那一批
+        where = "product_desc LIKE '%%先用后付%%'"
     sql = ("SELECT DATE_FORMAT(trade_time,'%Y-%m-%d %H:%i:%s'), amount, trans_id "
            f"FROM {db}.t_transaction "
-           "WHERE product_desc LIKE '%%先用后付%%' AND direction='out' "
+           f"WHERE {where} AND direction='out' "
            "AND is_primary=1 AND is_refund=0 ORDER BY trade_time")
     return [{"date": d, "amount": float(a), "id": i} for d, a, i in query(db, sql)]
 
@@ -62,11 +77,13 @@ def load_orders(path: str) -> list[dict]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="spending_waste")
+    ap.add_argument("--scope", choices=("prepay", "all"), default="prepay",
+                    help="prepay=只认先用后付（品类回填用）；all=全部拼多多支出（商品名补全用）")
     ap.add_argument("--orders", default=os.path.join(ROOT, "data", "pdd_classified.csv"))
     ap.add_argument("-o", "--out", default=os.path.join(ROOT, "data", "pdd_match.csv"))
     args = ap.parse_args()
 
-    txs = load_transactions(args.db)
+    txs = load_transactions(args.db, args.scope)
     items = load_orders(args.orders)
     by_pay: dict[str, list[dict]] = collections.defaultdict(list)
     by_all: dict[str, list[dict]] = collections.defaultdict(list)
@@ -74,7 +91,7 @@ def main() -> int:
         by_all[it["实付"]].append(it)
         if it.get("支付方式") == "先用后付":
             by_pay[it["实付"]].append(it)
-    print(f"先用后付交易 {len(txs)} 笔 · 页面有效商品行 {len(items)} 条"
+    print(f"scope={args.scope} · 账单侧交易 {len(txs)} 笔 · 页面有效商品行 {len(items)} 条"
           f"（其中带「先用后付」标签 "
           f"{sum(len(v) for v in by_pay.values())} 条）")
 

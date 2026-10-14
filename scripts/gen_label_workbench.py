@@ -32,6 +32,7 @@ import io
 import json
 import os
 import random
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,12 +47,48 @@ SAMPLE_STRATA = ("s1_0_5", "s2_5_10", "s3_10_20")
 # -------------------------------------------------------------
 # 一、取数 + 抽样
 # -------------------------------------------------------------
+# 账单「商品说明」字段里的占位文本：账单在电商/扫码支付这笔上根本不记商品，
+# 于是这列经常是下面这些词。直接显示等于没有信息，反而占地方。
+PLACEHOLDER_DESC = {
+    "消费", "先用后付", "/", "商品描述", "订单标题", "充值",
+    "无卡支付", "线下支付", "浦发支付", "二维码收款", "收款方备注:二维码收款",
+    "收款方备注：二维码收款", "支付成功", "交易成功",
+}
+
+
+def clean_desc(s: str) -> str:
+    """把「商品说明」里的占位文本 / 拼上去的商户单号清理掉，没价值就返回空串。
+
+    实测样本：'消费' / '先用后付' / '/' / '订单标题' / '收款方备注:二维码收款'
+             '财经大学晨光文具_10021002606102002340700037379837_76418260615314001'
+             '京东-订单编号3542417000171514'
+    后两条把订单号拼进了商品名，留着只会让列宽爆掉，取前面的可读部分。
+    """
+    s = (s or "").strip()
+    if not s or s in PLACEHOLDER_DESC:
+        return ""
+    s = re.sub(r"[_\-]?\d{10,}", " ", s)          # 长数字串 = 单号，去掉
+    s = re.sub(r"\s{2,}", " ", s).strip(" _-/：:")
+    if s.startswith(("商户单号", "订单编号")) or len(s) < 2:
+        return ""
+    return s
+
+
 def fetch_candidates(conn) -> list[dict]:
-    """从 v_idle_candidate 取标注候选全集（口径唯一来源，见 01_schema.sql）。"""
+    """从 v_idle_candidate 取标注候选全集（口径唯一来源，见 01_schema.sql）。
+
+    商品名优先取 t_goods_detail.goods_title（从拼多多订单列表还原的真实商品标题），
+    没有才退回账单原文的 product_desc —— 后者在电商这笔上通常是'先用后付'这类占位词。
+    """
     sql = """
         SELECT v.trans_id, DATE_FORMAT(v.trade_time, '%Y-%m-%d %H:%i:%s') AS tm,
                COALESCE(v.counterparty, '') AS cp,
                COALESCE(v.product_desc, '') AS pd,
+               COALESCE(v.shop_name,   '') AS shop,
+               COALESCE(v.goods_title, '') AS gt,
+               COALESCE(v.spec,        '') AS spec,
+               COALESCE(v.alt_titles,  '') AS alt,
+               COALESCE(v.goods_match, '') AS gm,
                v.amount, v.category_code, v.category_name, v.stratum
         FROM v_idle_candidate v
         ORDER BY v.trade_time
@@ -63,6 +100,11 @@ def fetch_candidates(conn) -> list[dict]:
         for r in cur.fetchall():
             d = dict(zip(cols, r))
             d["amount"] = float(d["amount"])      # DECIMAL → float，否则 json 序列化报错
+            d["raw_cp"] = d["cp"]                 # 账单原文的"对方"，用来判断是不是平台占位词
+            d["cp"] = d["shop"] or d["cp"]        # 有店铺名就用店铺名（"拼多多平台商户"没信息量）
+            d["pd"] = d["gt"] or clean_desc(d["pd"])
+            if d["pd"] and d["pd"] == d["cp"]:
+                d["pd"] = ""                      # 商品名跟店铺名一模一样 = 没信息，别占两列
             out.append(d)
 
     # 自检：trade_time 必须是真的被格式化过。
@@ -216,6 +258,21 @@ TEMPLATE = r"""<!DOCTYPE html>
   <div class="sub">待标 <b id="h-total">0</b> 笔 ｜ 全标层 ≥¥20 共 <b>__N_ALL__</b> 笔 ｜
     抽样层各 __PER__ 笔（随机种子 <b>__SEED__</b>，可复现）</div>
 
+  <div class="card" style="border-color:#e8d9b6;background:var(--gold-l)">
+    <h2 style="color:var(--gold)">商品名从哪来的（先看这段）</h2>
+    <div style="font-size:13px">
+      微信/支付宝账单在电商这笔上**只记到收单机构**，不记商品：
+      <span class="mini muted">对方=「拼多多平台商户」、商品说明=「先用后付」</span>。
+      所以直接看账单，¥12.80 一单根本想不起来买的是什么 —— 这不是你记性差，是数据本身没有。
+      <br><br>
+      本次已用**拼多多订单列表**（你自己导出的那份）把商品名还原回账单：
+      <b id="h-named">0</b> 笔有真实商品名，<b id="h-alt">0</b> 笔只还原出候选（金额相同有几件，
+      黄标「候选待判」，展开能看到候选列表，自己挑），剩余 <b id="h-noname">0</b> 笔确实无从还原
+      （线下门店那类，商户名本身就说明了买什么）。<br>
+      <b>点工具条的「只看没商品名的」可以专门处理剩下这些。</b>
+    </div>
+  </div>
+
   <div class="card steps">
     <div class="step"><b>① 补品类</b>「现分类」是电商综合的先改（共 <b id="h-need">0</b> 笔）。<br>
       <span class="muted">如果这笔其实是即时消耗——超市零食、洗衣、话费——就改成「生活服务 / 餐饮 / 交通」，它会自动移出标注范围，不必再判闲置。</span></div>
@@ -250,7 +307,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <div class="card tools">
-    <input type="text" id="q" placeholder="搜对方 / 商品说明…">
+    <input type="text" id="q" placeholder="搜商品名 / 店铺…">
     <select id="f-stratum"><option value="">全部层</option>__STROPT__</select>
     <select id="f-cat"><option value="">全部分类</option></select>
     <select id="f-state">
@@ -266,6 +323,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       <option value="amt">按金额从大到小</option>
     </select>
     <label class="chk"><input type="checkbox" id="f-need"> 只看需补品类</label>
+    <label class="chk"><input type="checkbox" id="f-noname"> 只看没商品名的</label>
     <span class="grow"></span>
     <button id="btn-expand">全部展开</button>
     <button id="btn-print">打印清单</button>
@@ -274,10 +332,10 @@ TEMPLATE = r"""<!DOCTYPE html>
 
   <table class="main">
     <thead><tr>
-      <th style="width:130px">时间</th>
-      <th style="width:74px">抽样层</th>
-      <th>对方</th>
-      <th>商品说明</th>
+      <th style="width:126px">时间</th>
+      <th style="width:70px">抽样层</th>
+      <th style="width:150px">店铺 / 对方</th>
+      <th>商品名</th>
       <th style="width:80px" class="num">金额</th>
       <th style="width:92px">现分类</th>
       <th style="width:150px">补品类</th>
@@ -327,6 +385,9 @@ function isDone(r){
 }
 const $ = s=>document.querySelector(s);
 function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+// 账单里只写到"收单机构"的电商/平台类对方，这类才真正"没记商品名"
+const PLATFORM_RE = /^(拼多多|抖音|淘宝|天猫|京东|唯品会|快手|小红书|美团|饿了么)(平台商户|支付|电商商家|电商|商城|支付科技|信息技术)/;
+function isPlatform(cp){ return PLATFORM_RE.test(String(cp||"")); }
 
 function fillFilters(){
   const seen={};
@@ -335,12 +396,13 @@ function fillFilters(){
 }
 function filtered(){
   const q=$("#q").value.trim().toLowerCase(), fs=$("#f-stratum").value, fc=$("#f-cat").value,
-        st=$("#f-state").value, need=$("#f-need").checked;
+        st=$("#f-state").value, need=$("#f-need").checked, noname=$("#f-noname").checked;
   const out = ROWS.filter(r=>{
     if(fs && r.stratum!==fs) return false;
     if(fc && r.category_code!==fc) return false;
     if(need && r.category_code!=="ECOMM") return false;
-    if(q && (r.cp+r.pd).toLowerCase().indexOf(q)<0) return false;
+    if(noname && (r.pd || r.alt)) return false;
+    if(q && (r.cp+r.pd+r.alt+r.spec+r.category_name).toLowerCase().indexOf(q)<0) return false;
     const s=state[r.id]||{}, moved=movedOut(r);
     // 已移出标注范围的（品类被改判为即时消耗）：只在"全部状态"和"只看已移出"里出现
     if(st==="out") return moved;
@@ -367,11 +429,25 @@ function rowHTML(r){
   const cls = "row" + (isDone(r)&&!moved?" done":"") + (moved?" out":"");
   const catTag = needCat ? `<span class="tag warn">${r.category_name}</span>`
                          : `<span class="tag">${r.category_name}</span>`;
+  // 商品名：优先真实标题；只有候选的给黄标；都没有就明说"账单没记"
+  let goods;
+  if(r.pd){
+    goods = esc(r.pd);
+    if(r.spec) goods += `<span class="mini muted"> · ${esc(r.spec)}</span>`;
+    if(r.gm==="fuzzy") goods += ` <span class="tag warn" title="金额相同有多个候选，跨类，建议扫一眼">存疑</span>`;
+  }else if(r.alt){
+    goods = `<span class="tag warn">候选待判</span> <span class="mini muted">${esc(r.alt)}</span>`;
+  }else{
+    // 没有任何商品名：平台单是"平台没记"，线下店是"店铺名本身就说清了"
+    goods = isPlatform(r.raw_cp)
+      ? `<span class="mini muted">平台单没记商品，只能靠回想</span>`
+      : `<span class="mini muted">看左边店铺名</span>`;
+  }
   let h = `<tr class="${cls}" data-id="${r.id}">
     <td class="mini muted">${r.tm}</td>
     <td class="mini"><span class="tag ${r.stratum==="all"?"all":"gray"}">${SLABEL[r.stratum]}</span></td>
     <td class="mini">${esc(r.cp)}</td>
-    <td class="mini muted">${esc(r.pd)}</td>
+    <td class="mini">${goods}</td>
     <td class="num"><b>${r.amount.toFixed(2)}</b></td>
     <td>${catTag}</td>
     <td><select class="c${effCat(r)==="ECOMM"?" need":""}" data-id="${r.id}">${catOptions(r)}</select></td>
@@ -392,10 +468,14 @@ function rowHTML(r){
         ${REASONS.map(x=>`<option value="${x}"${s.reason===x?" selected":""}>${x||"未选"}</option>`).join("")}</select></div>
       <div><label>实际用了几天（自估）</label><input type="number" min="0" class="d" data-id="${r.id}" value="${s.days||""}" placeholder="如 3"></div>
       <div style="grid-column:1/-1"><label>备注（可留空）</label>
-        <input type="text" class="n" data-id="${r.id}" value="${esc(s.note||"")}" placeholder="如：拼多多买的收纳盒，现在还在用"></div>
+        <input type="text" class="n" data-id="${r.id}" value="${esc(s.note||"")}" placeholder="如：收纳盒，现在还在用"></div>
     </div>
-    <div class="mini muted" style="margin-top:8px">交易号 #${r.id} ｜ 原分类 ${r.category_code} ｜ 抽样层 ${r.stratum}
-      ｜ 统计时本层一笔代表 ${(META[r.stratum].universe/META[r.stratum].sampled).toFixed(2)} 笔</div>
+    <div class="mini muted" style="margin-top:8px">
+      交易号 #${r.id} ｜ 原分类 ${r.category_code} ｜ 抽样层 ${r.stratum}
+      ｜ 统计时本层一笔代表 ${(META[r.stratum].universe/META[r.stratum].sampled).toFixed(2)} 笔
+      ${r.pd ? "｜ 商品名来自拼多多订单列表" + (r.gm && r.gm!=="unique" ? `（匹配强度 ${r.gm}）` : "") : ""}
+      ${r.alt ? "｜ 账单只给了金额，上面几个是页面里同金额的候选，点选对的即可" : ""}
+    </div>
   </td></tr>`;
   return h;
 }
@@ -422,9 +502,14 @@ function updateStats(){
   const amt = ROWS.reduce((a,r)=>a+r.amount,0);
   const outCnt = ROWS.filter(movedOut).length;
   const done = ROWS.filter(isDone).length;
+  const named = ROWS.filter(r=>r.pd).length;
+  const alt = ROWS.filter(r=>!r.pd && r.alt).length;
+  const platNo = ROWS.filter(r=>!r.pd && !r.alt && isPlatform(r.raw_cp)).length;
   $("#k-total").textContent=total; $("#k-need").textContent=need;
   $("#k-amt").textContent="¥"+amt.toFixed(0); $("#k-done").textContent=done;
   $("#k-out").textContent=outCnt; $("#h-need").textContent=need; $("#h-total").textContent=total;
+  const hn=$("#h-named"), ha=$("#h-alt"), hz=$("#h-noname");
+  if(hn) hn.textContent=named; if(ha) ha.textContent=alt; if(hz) hz.textContent=platNo;
   $("#bar").style.width=(done/total*100).toFixed(1)+"%";
   $("#p-done").textContent = done + " / " + total;
   $("#hint").textContent = done===0 ? "点任意一行展开，开始判定 →"
@@ -454,7 +539,7 @@ document.addEventListener("input", e=>{
   if(el.id==="q"){ render(); return; }
   if(el.classList.contains("n")){ S(el.dataset.id).note=el.value; save(); }
 });
-["f-stratum","f-cat","f-state","f-sort","f-need"].forEach(id=>$("#"+id).addEventListener("change",render));
+["f-stratum","f-cat","f-state","f-sort","f-need","f-noname"].forEach(id=>$("#"+id).addEventListener("change",render));
 
 $("#btn-expand").onclick=()=>{
   const anyClosed = ROWS.some(r=>!open[r.id]);
@@ -471,12 +556,14 @@ function download(name, text){
   setTimeout(()=>URL.revokeObjectURL(a.href),4000);
 }
 $("#btn-csv").onclick=()=>{
-  const head=["trans_id","交易时间","抽样层","对方","商品说明","金额","原分类","最终品类","品类名称","是否闲置","闲置程度","闲置原因","使用天数","备注"];
+  const head=["trans_id","交易时间","抽样层","店铺或对方","商品名","规格","候选（待人工确认）","商品名匹配强度",
+              "金额","原分类","最终品类","品类名称","是否闲置","闲置程度","闲置原因","使用天数","备注"];
   const lines=[head.join(",")];
   ROWS.forEach(r=>{
     const s=state[r.id]||{};
     const cat=effCat(r);
-    const cells=[r.id,r.tm,r.stratum,r.cp,r.pd,r.amount.toFixed(2),r.category_code,cat,CATNAME[cat],
+    const cells=[r.id,r.tm,r.stratum,r.cp,r.pd,r.spec||"",r.alt||"",r.gm||"",
+      r.amount.toFixed(2),r.category_code,cat,CATNAME[cat],
       movedOut(r)?"已移出":(s.idle===""||s.idle===undefined?"":(s.idle==="1"?"闲置":"在用")),
       s.deg||"",s.reason||"",s.days||"",s.note||""];
     lines.push(cells.map(v=>{ v=String(v); return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v; }).join(","));
@@ -488,8 +575,8 @@ $("#btn-sql").onclick=()=>{
   ROWS.forEach(r=>{
     const s=state[r.id]||{}, cat=effCat(r);
     if(cat!==r.category_code)
-      upd.push(`UPDATE t_transaction SET category_id=(SELECT category_id FROM t_category WHERE category_code='${cat}'), category_src='manual' WHERE trans_id=${r.id};   -- ${r.category_code} → ${cat}`);
-    if(movedOut(r)){ skipped.push(`-- #${r.id} ${r.tm} ¥${r.amount.toFixed(2)} 已改判为即时消耗（${cat}），不标注`); return; }
+      upd.push(`UPDATE t_transaction SET category_id=(SELECT category_id FROM t_category WHERE category_code='${cat}'), category_src='manual' WHERE trans_id=${r.id};   -- ${r.category_code} → ${cat} ｜ ${r.pd || r.cp}`);
+    if(movedOut(r)){ skipped.push(`-- #${r.id} ${r.tm} ¥${r.amount.toFixed(2)} ${r.pd || r.cp} 已改判为即时消耗（${cat}），不标注`); return; }
     if(s.idle==="1"||s.idle==="0"){
       const deg = s.idle==="1" ? (s.deg||"1") : "0";
       const rs  = s.reason ? `'${s.reason}'` : "NULL";
@@ -498,7 +585,8 @@ $("#btn-sql").onclick=()=>{
       ins.push(`INSERT INTO t_idle_label (trans_id,is_idle,idle_degree,idle_reason,used_days,sample_stratum,note)`
              + ` VALUES (${r.id},${s.idle},${deg},${rs},${dy},'${r.stratum}',${nt})`
              + ` ON DUPLICATE KEY UPDATE is_idle=VALUES(is_idle),idle_degree=VALUES(idle_degree),`
-             + `idle_reason=VALUES(idle_reason),used_days=VALUES(used_days),sample_stratum=VALUES(sample_stratum),note=VALUES(note);`);
+             + `idle_reason=VALUES(idle_reason),used_days=VALUES(used_days),sample_stratum=VALUES(sample_stratum),note=VALUES(note);`
+             + `   -- ${r.tm} ¥${r.amount.toFixed(2)} ${r.pd || r.cp}`);
     }
   });
   const strata = Object.keys(META).map(k=>`--   ${k}: 总体 ${META[k].universe} 笔 / 标注 ${META[k].sampled} 笔 / 加权 ${(META[k].universe/META[k].sampled).toFixed(4)}`).join("\n");

@@ -237,6 +237,48 @@ CREATE TABLE t_risk_record (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='购买预警记录表（含事后回填）';
 
 
+-- -------------------------------------------------------------
+-- 9. t_goods_detail  商品名补全表（派生表，可整表重建）
+--
+--   ★ 为什么需要这张表 ★
+--   微信/支付宝账单在**电商平台**这笔上只记到"收单机构"，不记商品：
+--       对方 = 拼多多平台商户 / 拼多多支付
+--       商品说明 = 先用后付 / 消费 / /
+--   实测候选池 776 笔里 653 笔是拼多多、523 笔商品说明是占位文本。
+--   而没有商品名 → 标注时根本回忆不起买了什么 → 闲置标签不可信。
+--
+--   ★ 为什么不直接改 t_transaction.product_desc ★
+--   dedup_key = MD5(来源+时间+金额+对方+商品说明)，product_desc 是**去重指纹的输入**。
+--   一旦就地覆盖，同一份账单重新导入会算出不同的 dedup_key → 整批数据翻倍。
+--   所以账单原文必须只读，补全信息另立派生表（与 t_trans_feature 同思路：
+--   可重算的东西不写进事实表）。
+--
+--   ★ 数据来源与可信度 ★
+--   来源是拼多多订单列表页（用户导出）解析出的商品卡片，靠
+--   (交易时间, 金额) 与账单逐笔匹配。match_confidence 记录匹配强度：
+--       unique  金额在候选池里唯一命中
+--       same_cat 同金额多候选，且与账单已定分类一致 → 投票选中
+--       ordered 候选数 == 同金额交易数 → 按页面倒序顺序对齐
+--       fuzzy   以上都不满足，跨类兜底（需人工扫一眼）
+--   fuzzy 的记录在盘点工作台里会带黄标提示，其余可直接采信。
+-- -------------------------------------------------------------
+CREATE TABLE t_goods_detail (
+  trans_id         BIGINT UNSIGNED NOT NULL COMMENT '对应交易（一交易一补全行）',
+  shop_name        VARCHAR(120) DEFAULT NULL    COMMENT '店铺名，如"六品堂官方旗舰店"',
+  goods_title      VARCHAR(255) DEFAULT NULL    COMMENT '商品标题，如"六品堂宋徽宗瘦金体字帖…"',
+  spec             VARCHAR(120) DEFAULT NULL    COMMENT '规格，如"×1，瘦金体一本通"',
+  alt_titles       VARCHAR(500) DEFAULT NULL    COMMENT '匹配没定夺时的候选商品标题，用 / 分隔，供人工判断',
+  match_confidence ENUM('unique','same_cat','ordered','fuzzy')
+                                NOT NULL DEFAULT 'fuzzy' COMMENT '匹配强度，见表注释',
+  source           VARCHAR(20)  NOT NULL DEFAULT 'pdd_order' COMMENT '补全来源',
+  created_at       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (trans_id),
+  KEY idx_goods_confidence (match_confidence),
+  CONSTRAINT fk_goods_trans FOREIGN KEY (trans_id)
+    REFERENCES t_transaction (trans_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品名补全表（派生，可由订单列表重建）';
+
+
 SET FOREIGN_KEY_CHECKS = 1;
 
 
@@ -375,6 +417,8 @@ GROUP BY DATE_FORMAT(t.trade_time, '%Y-%m');
 -- 视图 6：标注候选全集（口径唯一来源）
 --   口径：支出 / 非退款 / 计入统计(is_primary=1) / 消费类 / 耐用品 / 支付成功
 --   stratum：全样本层 all（>=20 元）与三个抽样层 s1~s3
+--   ★ 关联 t_goods_detail 只是"带上补全的商品名"，是 1:0或1 的 LEFT JOIN，
+--     不会改变候选行数（口径数字对不上时先查这里）
 CREATE OR REPLACE VIEW v_idle_candidate AS
 SELECT
   t.trans_id,
@@ -382,6 +426,11 @@ SELECT
   t.trade_time,
   t.counterparty,
   t.product_desc,
+  g.shop_name,
+  g.goods_title,
+  g.spec,
+  g.alt_titles,
+  g.match_confidence                            AS goods_match,
   t.amount,
   c.category_id,
   c.category_code,
@@ -394,6 +443,7 @@ SELECT
   END AS stratum
 FROM t_transaction t
 JOIN t_category c ON c.category_id = t.category_id
+LEFT JOIN t_goods_detail g ON g.trans_id = t.trans_id
 WHERE t.direction = 'out'
   AND t.is_refund = 0
   AND t.is_primary = 1
