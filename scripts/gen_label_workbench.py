@@ -49,7 +49,7 @@ SAMPLE_STRATA = ("s1_0_5", "s2_5_10", "s3_10_20")
 def fetch_candidates(conn) -> list[dict]:
     """从 v_idle_candidate 取标注候选全集（口径唯一来源，见 01_schema.sql）。"""
     sql = """
-        SELECT v.trans_id, DATE_FORMAT(v.trade_time, '%%Y-%%m-%%d %%H:%%i:%%s') AS tm,
+        SELECT v.trans_id, DATE_FORMAT(v.trade_time, '%Y-%m-%d %H:%i:%s') AS tm,
                COALESCE(v.counterparty, '') AS cp,
                COALESCE(v.product_desc, '') AS pd,
                v.amount, v.category_code, v.category_name, v.stratum
@@ -64,7 +64,15 @@ def fetch_candidates(conn) -> list[dict]:
             d = dict(zip(cols, r))
             d["amount"] = float(d["amount"])      # DECIMAL → float，否则 json 序列化报错
             out.append(d)
-        return out
+
+    # 自检：trade_time 必须是真的被格式化过。
+    # 踩过的坑：SQL 写成 '%%Y-%%m-%%d' 时，pymysql 只在「带参数执行」时才还原 %%
+    # （源码：args 为 None 就完全不做 % 处理），于是 %% 被原样送给 MySQL，
+    # DATE_FORMAT 原样吐出字面量 "%Y-%m-%d"，页面上就是一串格式符而非真实时间，
+    # 而且**一句报错都没有**。
+    if out and (len(out[0]["tm"]) < 16 or out[0]["tm"][4] != "-"):
+        raise SystemExit(f"trade_time 格式异常：{out[0]['tm']!r}（原因见 fetch_candidates 注释）")
+    return out
 
 
 def fetch_categories(conn) -> list[dict]:

@@ -41,6 +41,7 @@ SET FOREIGN_KEY_CHECKS = 1;
 -- -------------------------------------------------------------
 INSERT INTO t_category (category_id, parent_id, category_code, category_name, is_consumption, is_durable, sort_no) VALUES
   ( 1, NULL, 'FOOD',    '餐饮',     1, 0,  10),
+  (14, NULL, 'GROC',    '食品生鲜', 1, 0,  15),
   ( 2, NULL, 'TRAFFIC', '交通',     1, 0,  20),
   ( 3, NULL, 'APPAREL', '服饰美妆', 1, 1,  30),
   ( 4, NULL, 'DIGITAL', '数码电器', 1, 1,  40),
@@ -71,6 +72,14 @@ INSERT INTO t_category (category_id, parent_id, category_code, category_name, is
 --                  判据：这笔钱在消费完成的瞬间就被消耗掉，不存在"买回来放着不用"。
 --                  注意与 is_durable 的分工：is_consumption 回答"算不算消费"，
 --                  is_durable 回答"有没有闲置的可能"，两者不能混用。
+--   14 食品生鲜（v5 新增）—— 由拼多多订单回填暴露出来的缺口：
+--                  716 笔「先用后付」扣款还原出真实商品后，**294 笔（41.3%）是水果
+--                  /零食/速冻食品/生鲜**，金额 ¥3,619.58，是电商品类里最大的一块。
+--                  原有分类只有「餐饮」（堂食/外卖），把它塞进餐饮会让"在外吃饭的
+--                  钱"虚高；归入生活日用（耐用品）则更糟 —— 食品不存在"闲置"概念，
+--                  会把闲置率的分母污染掉。故单列一类，且 is_durable = 0。
+--                  已知局限：促销囤积到过期未吃掉的食品，本口径下不计为浪费（记入
+--                  说明书研究局限）。
 
 -- 非消费类（is_consumption = 0）：不参与消费统计与闲置分析
 INSERT INTO t_category (category_id, parent_id, category_code, category_name, is_consumption, is_durable, sort_no) VALUES
