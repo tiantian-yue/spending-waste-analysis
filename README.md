@@ -56,7 +56,8 @@ spending-waste-analysis/
 │   ├── gen_pdd_backfill_sql.py 固化匹配结果为 SQL 补丁
 │   ├── gen_goods_detail_sql.py 固化商品名补全结果为 SQL 补丁
 │   ├── reclass_food_as_groc.py 候选池里的食品 → 改判 GROC（自动移出标注范围）
-│   └── gen_label_workbench.py 生成分层抽样的闲置盘点工作台
+│   ├── gen_label_workbench.py 生成分层抽样的闲置盘点工作台
+│   └── selftest_workbench.js  工作台离线自检（不需要浏览器，见「自检」）
 ├── sql/
 │   ├── 01_schema.sql       建库 + 9 表 + 8 视图 + 索引
 │   ├── 02_seed.sql         18 个分类 + 307 条自动分类规则 + 开发账号
@@ -242,6 +243,24 @@ python run.py
   `≥20 元` 全标 154 笔，`0~5 / 5~10 / 10~20` 三层各随机抽 60 笔（种子 20261012，可复现），
   共 **334 笔**。抽样脚本 `scripts/gen_label_workbench.py` 同时产出盘点工作台；
   加权还原见 `v_stratum_weight` / `v_category_idle_rate_weighted`。
+
+### 工作台自检（生成后必跑）
+
+工作台是"整个前端内嵌进单个 HTML"的形态，SQL / Python / JS 三处字段名只要有一处
+对不上，**页面不会报错，只会悄悄算出错误结果**。真实事故：SQL 查出来叫 `trans_id`、
+JS 通篇写 `r.id`，于是 `r.id` 恒为 `undefined`，334 行共用同一份 state，
+用户改任意一行、触发一次 render，全表一起变成"已移出/已判定"，导出的 SQL 还是
+`WHERE trans_id=undefined` —— 一句报错都没有。
+
+现在有两道闸：
+
+1. `gen_label_workbench.py` 生成期断言：每行的 `id` 必须存在、是整数、且互不重复；
+2. `scripts/selftest_workbench.js` 用 Node + 最小 DOM 打桩把页面逻辑跑一遍
+   （不需要浏览器），断言"改一行只影响一行"、导出内容落在真实交易号上：
+
+```bash
+node scripts/selftest_workbench.js "闲置盘点工作台.html"
+```
 
 ## 数据库
 

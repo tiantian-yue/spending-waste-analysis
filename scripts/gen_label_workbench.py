@@ -103,6 +103,13 @@ def fetch_candidates(conn) -> list[dict]:
         out = []
         for r in cur.fetchall():
             d = dict(zip(cols, r))
+            # ⚠️ 前端（内嵌 JS）通篇用 r.id 当每行的唯一键，而 SQL 查出来叫 trans_id。
+            #    曾被这个错位坑惨：r.id 恒为 undefined → 所有行共用同一份 state
+            #    （localStorage 里就一个 "undefined" 键），用户只要动任意一行的下拉框，
+            #    再触发一次 render，**全表 334 行一起变成"已移出/已判定"**，
+            #    而且导出的 SQL 是 `WHERE trans_id=undefined`。
+            #    所以这里必须显式补 id，并在下面做唯一性自检。
+            d["id"] = int(d["trans_id"])
             d["amount"] = float(d["amount"])      # DECIMAL → float，否则 json 序列化报错
             d["raw_cp"] = d["cp"]                 # 账单原文的"对方"，用来判断是不是平台占位词
             d["cp"] = d["shop"] or d["cp"]        # 有店铺名就用店铺名（"拼多多平台商户"没信息量）
@@ -124,6 +131,17 @@ def fetch_candidates(conn) -> list[dict]:
     # 而且**一句报错都没有**。
     if out and (len(out[0]["tm"]) < 16 or out[0]["tm"][4] != "-"):
         raise SystemExit(f"trade_time 格式异常：{out[0]['tm']!r}（原因见 fetch_candidates 注释）")
+
+    # 自检：id 必须存在且唯一。
+    # 踩过的坑见上面 d["id"] 的注释 —— 少了这个字段，全表 334 行会共用一份 state，
+    # 用户改一行、全表跟着变，且一句报错都没有。这类"静默错位"必须在生成期拦住。
+    ids = [r.get("id") for r in out]
+    if any(not isinstance(i, int) for i in ids):
+        bad = [i for i in ids if not isinstance(i, int)][:3]
+        raise SystemExit(f"行的 id 不是整数：{bad!r}（前端靠 r.id 区分每一行，缺它全表会串成一份状态）")
+    if len(set(ids)) != len(ids):
+        dup = [i for i in set(ids) if ids.count(i) > 1][:5]
+        raise SystemExit(f"行的 id 有重复：{dup!r}（前端靠 r.id 区分每一行，重复则状态会互相覆盖）")
     return out
 
 
@@ -383,14 +401,27 @@ const SLABEL = __SLABEL__;
 const CATNAME = {}; CATS.forEach(c=>CATNAME[c.code]=c.name);
 const DURABLE = {}; CATS.forEach(c=>DURABLE[c.code]=c.durable);
 const REASONS = ["","冲动消费","重复购买","与描述不符","尺寸不合适","三分钟热度","促销囤货","其他"];
-const KEY = "idle_workbench_v2";
+// v2 作废：那一版前端拿不到每行的 id（r.id 恒为 undefined），所有行的填写内容
+// 全挤在同一个 "undefined" 键里，改一行=全表跟着变。v3 起每行有真实 trans_id 作键。
+const KEY = "idle_workbench_v3";
 
 let state = {};
 let open = {};
 
-function load(){ try{ state = JSON.parse(localStorage.getItem(KEY)||"{}"); }catch(e){ state={}; } }
+function load(){
+  try{ state = JSON.parse(localStorage.getItem(KEY)||"{}"); }catch(e){ state={}; }
+  // 兜底：清掉脏键。老版本曾把所有行的填写挤在 "undefined" 这一个键下面。
+  ["undefined","null","NaN",""].forEach(k=>{ if(k in state) delete state[k]; });
+}
 function save(){ localStorage.setItem(KEY, JSON.stringify(state)); }
-function S(id){ if(!state[id]) state[id]={cat:"",idle:"",deg:"",reason:"",days:"",note:""}; return state[id]; }
+function S(id){
+  // 兜底：id 必须是真实的交易号。曾经 r.id 恒为 undefined，导致所有行共用同一份
+  // state —— 用户改一行、全表 334 行一起变成"已移出/已判定"，还一句报错都没有。
+  // 与其静默错下去，不如在这里直接炸出来（页面会白屏，但至少不会被假数据骗）。
+  if(id===undefined||id===null||id==="") throw new Error("行缺少 id，无法区分每一行（见 fetch_candidates 注释）");
+  if(!state[id]) state[id]={cat:"",idle:"",deg:"",reason:"",days:"",note:""};
+  return state[id];
+}
 function effCat(r){ const s=state[r.id]; return (s && s.cat) ? s.cat : r.category_code; }
 function movedOut(r){ return DURABLE[effCat(r)] === 0; }          // 改到即时消耗分类 = 移出标注范围
 function isDone(r){
@@ -499,7 +530,7 @@ function rowHTML(r){
   return h;
 }
 function refreshRow(id){
-  const r = ROWS.find(x=>x.id==id); if(!r) return;
+  const r = ROWS.find(x=>String(x.id)===String(id)); if(!r) return;
   const tr = document.querySelector('tr.row[data-id="'+id+'"]'); if(!tr) return;
   const s = state[id]||{}, moved = movedOut(r);
   tr.classList.toggle("done", isDone(r) && !moved);
