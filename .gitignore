@@ -46,3 +46,7 @@ sql/05_goods_detail.sql
 # 由 scripts/reclass_food_as_groc.py 从候选池生成，规则（词表）在脚本里，
 # 换一份账单重跑就能得到自己的 sql/06；不需要共享这份带商品名的补丁。
 sql/06_food_as_groc.sql
+
+# ---- 服务改判补丁：UPDATE 注释里带商户与商品说明，同上前两项 ----
+# 由 scripts/reclass_service.py 生成，规则（商户/说明词表）在脚本里。
+sql/07_service_out.sql
